@@ -7,8 +7,6 @@ import jnr.ffi.*;
 import jnr.ffi.annotations.In;
 import jnr.ffi.annotations.Out;
 import jnr.ffi.annotations.Transient;
-import jnr.ffi.byref.IntByReference;
-import jnr.posix.Timeval;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
@@ -57,8 +55,7 @@ public class NetStream {
         int bind(int fd, SockAddr addr, int len);
         int accept(int fd, @Out SockAddr addr, int[] len);
         int connect(int s, @In @Transient SockAddr name, int namelen);
-        int setsockopt(int fd, int level, int optname, @In Timeval optval, int optlen);
-        int getsockname(int fd, @Out SockAddr addr, @In @Out IntByReference len);
+        int getsockname(int fd, @Out SockAddr addr, @In int len);
 
     }
     static short htons(short val) {
@@ -178,7 +175,7 @@ public class NetStream {
         sockaddr.sin_family.set(htons((short) LibC.AF_INET));
         sockaddr.sin_addr.set(ByteBuffer.wrap(inet_addr.getAddress()).getInt());
         sockaddr.sin_port.set(htons((short) port));
-        libc.connect(sock, sockaddr, SockAddr.size(sockaddr));
+        libc.connect(sock, sockaddr, Struct.size(sockaddr));
         stat = 1;
         wbuf = new byte[0];
         rbuf = new byte[0];
@@ -295,13 +292,6 @@ public class NetStream {
         byte[] data;
     }
 
-    static SockAddrIN getsockname(int sockfd) {
-        SockAddrIN addr = new SockAddrIN();
-        IntByReference len = new IntByReference(SockAddr.size(addr));
-        libc.getsockname(sockfd, addr, len);
-        return addr;
-    }
-
     public static class NetHost {
         int host = 0;
         int stat = 0;
@@ -331,7 +321,8 @@ public class NetStream {
             }
             libc.listen(sock, 65535);
             Native.setBlocking(sock, false);
-            port = ntohs(getsockname(sock).sin_port.get());
+            libc.getsockname(sock, sin, Struct.size(sin));
+            this.port = ntohs(sin.sin_port.get());
             stat = 1;
             timeslap = System.currentTimeMillis();
             return 0;
