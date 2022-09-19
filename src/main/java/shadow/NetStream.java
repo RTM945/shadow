@@ -7,22 +7,21 @@ import jnr.ffi.*;
 import jnr.ffi.annotations.In;
 import jnr.ffi.annotations.Out;
 import jnr.ffi.annotations.Transient;
+import jnr.ffi.byref.IntByReference;
 import jnr.posix.Timeval;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Set;
+import java.util.*;
 
 public class NetStream {
 
     static final String[] libnames = Platform.getNativePlatform().getOS() == Platform.OS.SOLARIS
             ? new String[] { "socket", "nsl", "c" }
             : new String[] { Platform.getNativePlatform().getStandardCLibraryName() };
+
     static final LibC libc = LibraryLoader.loadLibrary(LibC.class, Collections.emptyMap(), libnames);
     static final jnr.ffi.Runtime runtime = jnr.ffi.Runtime.getSystemRuntime();
 
@@ -59,10 +58,15 @@ public class NetStream {
         int accept(int fd, @Out SockAddr addr, int[] len);
         int connect(int s, @In @Transient SockAddr name, int namelen);
         int setsockopt(int fd, int level, int optname, @In Timeval optval, int optlen);
+        int getsockname(int fd, @Out SockAddr addr, @In @Out IntByReference len);
 
     }
     static short htons(short val) {
         return Short.reverseBytes(val);
+    }
+
+    static int ntohs(int val) {
+        return Integer.reverseBytes(val);
     }
 
     int sock;
@@ -89,9 +93,8 @@ public class NetStream {
         if (stat != 1) {
             return -1;
         }
-        libc.read(sock, new byte[]{}, 0);
-        int code = LastError.getLastError(runtime);
-        if (code != 0) {
+        if (libc.read(sock, new byte[]{}, 0) < 0) {
+            int code = LastError.getLastError(runtime);
             if (conn.contains(code)) {
                 return 0;
             }
@@ -103,6 +106,7 @@ public class NetStream {
             close();
             return -1;
         }
+
         stat = 2;
         return 1;
     }
@@ -125,18 +129,19 @@ public class NetStream {
         byte[] rdata = new byte[0];
         while (true) {
             byte[] text = new byte[1024];
-            int read = libc.read(sock, text, 1024);
-            if(read == 0) {
+            int ret = libc.read(sock, text, 1024);
+            if(ret == 0) {
                 // eof
                 break;
             }
-            int code = LastError.getLastError(runtime);
-            if (!errd.contains(code)) {
-                errc = code;
-                close();
-                return -1;
+            if (ret < 0){
+                int code = LastError.getLastError(runtime);
+                if (!errd.contains(code)) {
+                    errc = code;
+                    close();
+                    return -1;
+                }
             }
-
             rdata = concat(rdata, text);
         }
         rbuf = concat(rbuf, rdata);
@@ -144,16 +149,18 @@ public class NetStream {
     }
 
     public int try_send() {
-        int wsize = 0;
+        int wsize;
         if (wbuf.length == 0) {
             return 0;
         }
         wsize = libc.write(sock, wbuf, wbuf.length);
-        int code = LastError.getLastError(runtime);
-        if (!errd.contains(code)) {
-            errc = code;
-            close();
-            return -1;
+        if (wsize <= 0) {
+            int code = LastError.getLastError(runtime);
+            if (!errd.contains(code)) {
+                errc = code;
+                close();
+                return -1;
+            }
         }
         wbuf = Arrays.copyOfRange(wbuf, wsize, wbuf.length);
         return wsize;
@@ -168,7 +175,7 @@ public class NetStream {
         libc.setsockopt(sock, SocketLevel.SOL_SOCKET.intValue(), SocketOption.SO_KEEPALIVE.intValue(), buf, buf.remaining());
         InetAddress inet_addr = InetAddress.getByName(address);
         SockAddrIN sockaddr = new SockAddrIN();
-        sockaddr.sin_family.set((byte) LibC.AF_INET);
+        sockaddr.sin_family.set(htons((short) LibC.AF_INET));
         sockaddr.sin_addr.set(ByteBuffer.wrap(inet_addr.getAddress()).getInt());
         sockaddr.sin_port.set(htons((short) port));
         libc.connect(sock, sockaddr, SockAddr.size(sockaddr));
@@ -184,11 +191,7 @@ public class NetStream {
         if (sock == 0) {
             return 0;
         }
-        try {
-            libc.close(sock);
-        } catch (Exception ignore) {
-
-        }
+        libc.close(sock);
         sock = 0;
         return 0;
     }
@@ -280,7 +283,73 @@ public class NetStream {
         return 0;
     }
 
-    public static class NetHost {
+    static final int NET_NEW =		0;	// new connection：(id,tag) ip/d,port/w   <hid>
+    static final int NET_LEAVE =	1;	// lost connection：(id,tag)   		<hid>
+    static final int NET_DATA =		2;	// data coming：(id,tag) data...	<hid>
+    static final int NET_TIMER =	3;	// timer event: (none, none)
 
+    public static class Msg {
+        int type;
+        int hid;
+        int tag;
+        byte[] data;
+    }
+
+    static SockAddrIN getsockname(int sockfd) {
+        SockAddrIN addr = new SockAddrIN();
+        IntByReference len = new IntByReference(SockAddr.size(addr));
+        libc.getsockname(sockfd, addr, len);
+        return addr;
+    }
+
+    public static class NetHost {
+        int host = 0;
+        int stat = 0;
+        Map<Integer, NetStream> clients = new HashMap<>();
+        LinkedList<Msg> queue = new LinkedList<>();
+        int index = 1;
+        int count = 0;
+        int sock = 0;
+        int port = 0;
+        int timeout = 70;
+        long timeslap = System.currentTimeMillis();
+        int period = 0;
+
+        public int startup(int port) {
+            shutdown();
+            sock = libc.socket(LibC.AF_INET, LibC.SOCK_STREAM, 0);
+            ByteBuffer buf = ByteBuffer.allocate(4);
+            buf.order(ByteOrder.nativeOrder());
+            buf.putInt(1).flip();
+            libc.setsockopt(sock, SocketLevel.SOL_SOCKET.intValue(), SocketOption.SO_REUSEADDR.intValue(), buf, buf.remaining());
+            SockAddrIN sin = new SockAddrIN();
+            sin.sin_family.set(htons((short) LibC.AF_INET));
+            sin.sin_port.set(htons((short) port));
+            if (libc.bind(sock, sin, Struct.size(sin)) < 0) {
+                libc.close(sock);
+                return -1;
+            }
+            libc.listen(sock, 65535);
+            Native.setBlocking(sock, false);
+            port = ntohs(getsockname(sock).sin_port.get());
+            stat = 1;
+            timeslap = System.currentTimeMillis();
+            return 0;
+        }
+
+        public void shutdown() {
+            if (sock != 0) {
+                libc.close(sock);
+            }
+            sock = 0;
+            index = 1;
+            for (NetStream client : clients.values()) {
+                client.close();
+            }
+            clients.clear();
+            queue.clear();
+            stat = 0;
+            count = 0;
+        }
     }
 }
