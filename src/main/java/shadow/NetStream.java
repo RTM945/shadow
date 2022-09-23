@@ -12,6 +12,7 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 public class NetStream {
@@ -22,6 +23,7 @@ public class NetStream {
 
     static final LibC libc = LibraryLoader.loadLibrary(LibC.class, Collections.emptyMap(), libnames);
     static final jnr.ffi.Runtime runtime = jnr.ffi.Runtime.getSystemRuntime();
+
 
     public static class SockAddr extends Struct {
         public SockAddr() {
@@ -56,6 +58,7 @@ public class NetStream {
         int accept(int fd, @Out SockAddr addr, int[] len);
         int connect(int s, @In @Transient SockAddr name, int namelen);
         int getsockname(int fd, @Out SockAddr addr, @In int len);
+        int getpeername(int fd, @Out SockAddr addr, @In int len);
 
     }
     static short htons(short val) {
@@ -71,13 +74,19 @@ public class NetStream {
     byte[] rbuf = new byte[0];
     int stat;
     int errc;
-    Set<Integer> errd = new HashSet<>() {{
+
+    int tag;
+    int hid;
+    long active;
+    int peername;
+
+    static Set<Integer> errd = new HashSet<>() {{
         add(Errno.EINPROGRESS.value());
         add(Errno.EALREADY.value());
         add(Errno.EWOULDBLOCK.value());
     }};
 
-    Set<Integer> conn = new HashSet<>() {{
+    static Set<Integer> conn = new HashSet<>() {{
         add(Errno.EISCONN.value());
         add(10057);
         add(10053);
@@ -290,6 +299,13 @@ public class NetStream {
         int hid;
         int tag;
         byte[] data;
+
+        public Msg(int type, int hid, int tag, byte[] data) {
+            this.type = type;
+            this.hid = hid;
+            this.tag = tag;
+            this.data = data;
+        }
     }
 
     public static class NetHost {
@@ -341,6 +357,62 @@ public class NetStream {
             queue.clear();
             stat = 0;
             count = 0;
+        }
+
+        private int __close(int hid) {
+            NetStream client = clients.get(hid);
+            if (client == null) {
+                return -2;
+            }
+            client.close();
+            return 0;
+        }
+
+        private int __send(int hid, byte[] data) {
+            NetStream client = clients.get(hid);
+            if (client == null) {
+                return -2;
+            }
+            client.send(data);
+            client.process();
+            return 0;
+        }
+
+        public int process() {
+            long current = System.currentTimeMillis();
+            if (stat != 1) {
+                return 0;
+            }
+            SockAddrIN sin = new SockAddrIN();
+            sin.sin_family.set(htons((short) LibC.AF_INET));
+            int clientfd = libc.accept(sock, sin, new int[]{ Struct.size(sin) });
+            if (clientfd > 0) {
+                Native.setBlocking(clientfd, false);
+                int hid = index;
+                index += 1;
+                NetStream client = new NetStream();
+                client.assign(clientfd);
+                client.hid = hid;
+                client.tag = 0;
+                client.active = current;
+                client.peername = libc.getpeername(clientfd, sin, Struct.size(sin));
+                clients.put(hid, client);
+                count += 1;
+                queue.add(new Msg(NET_NEW, hid, 0, sin.toString().getBytes(StandardCharsets.UTF_8)));
+            }
+            for (NetStream client : clients.values()) {
+                client.process();
+                while (client.status() == 2) {
+                    byte[] data = client.recv();
+                    queue.add(new Msg(NET_DATA, client.hid, client.tag, data));
+                    client.active = current;
+                }
+                long timeout = current - client.active;
+                if (client.status() == 0 || timeout > this.timeout) {
+
+                }
+            }
+            return 0;
         }
     }
 }
