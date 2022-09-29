@@ -409,10 +409,125 @@ public class NetStream {
                 }
                 long timeout = current - client.active;
                 if (client.status() == 0 || timeout > this.timeout) {
-
+                    int hid = client.hid;
+                    int tag = client.tag;
+                    queue.add(new Msg(NET_LEAVE, hid, tag, new byte[0]));
+                    client.close();
+                    count -= 1;
+                }
+            }
+            current = System.currentTimeMillis();
+            if (current - timeslap > 100000) {
+                timeslap = current;
+            }
+            int period = this.period;
+            if (period > 0) {
+                while (timeslap < current) {
+                    queue.add(new Msg(NET_TIMER, 0, 0, new byte[0]));
+                    timeslap += period;
                 }
             }
             return 0;
+        }
+
+        public int send(int hid, byte[] data) {
+            return __send(hid, data);
+        }
+
+        public int close(int hid) {
+            return __close(hid);
+        }
+
+        public int settag(int hid, int tag) {
+            NetStream client = clients.get(hid);
+            if (client == null) {
+                return -2;
+            }
+            client.tag = tag;
+            return 0;
+        }
+
+        public int gettag(int hid) {
+            NetStream client = clients.get(hid);
+            if (client == null) {
+                return -2;
+            }
+            return client.tag;
+        }
+
+        public Msg read() {
+            if (queue.isEmpty()) {
+                return new Msg(-1, 0, 0, new byte[0]);
+            }
+            return queue.removeFirst();
+        }
+
+        public void settimer(int mills) {
+            period = mills;
+            timeslap = System.currentTimeMillis();
+        }
+
+        public int nodelay(int hid, int nodelay) {
+            NetStream client = clients.get(hid);
+            if (client == null) {
+                return -1;
+            }
+            return client.nodelay(nodelay);
+        }
+    }
+
+
+    public static void main(String[] args) throws Exception {
+        NetHost host = new NetHost();
+        host.startup(2000);
+        NetStream stream = new NetStream();
+        long last = System.currentTimeMillis();
+        stream.connect("127.0.0.1", 2000);
+        stream.send("Hello".getBytes(StandardCharsets.UTF_8));
+        int stat = 0;
+        last = System.currentTimeMillis();
+
+        host.settimer(5000);
+        stream.nodelay(0);
+        stream.nodelay(1);
+        while (true) {
+            Thread.sleep(100);
+            host.process();
+            stream.process();
+            if (stat == 0) {
+                if (stream.status() == 2) {
+                    stat = 1;
+                    stream.send("Hello".getBytes(StandardCharsets.UTF_8));
+                    last = System.currentTimeMillis();
+                }
+            } else if (stat == 1) {
+                if (System.currentTimeMillis() - last >= 3000) {
+                    stream.send("VVVV".getBytes(StandardCharsets.UTF_8));
+                    stat = 2;
+                }
+            } else if (stat == 2) {
+                if (System.currentTimeMillis() - last >= 5000) {
+                    stream.send("exit".getBytes(StandardCharsets.UTF_8));
+                    stat = 3;
+                }
+            }
+            Msg read = host.read();
+            if (read.type < 0) {
+                continue;
+            }
+            System.out.println(read);
+            if (read.type == NET_DATA) {
+                String s = new String(read.data);
+                host.send(read.hid, ("RE: " + s).getBytes(StandardCharsets.UTF_8));
+                if (s.equals("exit")) {
+                    System.out.println("client request to exit");
+                    host.close(read.hid);
+                }
+            } else if (read.type == NET_NEW) {
+                host.send(read.hid, ("Hello client " + read.hid).getBytes(StandardCharsets.UTF_8));
+                host.settag(read.hid, read.tag);
+                host.nodelay(read.hid, 1);
+            }
         }
     }
 }
