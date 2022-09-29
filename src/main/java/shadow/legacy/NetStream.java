@@ -1,4 +1,4 @@
-package shadow;
+package shadow.legacy;
 
 import jnr.constants.platform.*;
 import jnr.enxio.channels.Native;
